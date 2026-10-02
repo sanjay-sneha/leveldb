@@ -51,6 +51,7 @@ static const char* FLAGS_benchmarks =
     "overwrite,"
     "readrandom,"
     "readrandom,"  // Extra run to allow previous compactions to quiesce
+    "readskewed,"
     "readseq,"
     "readreverse,"
     "compact,"

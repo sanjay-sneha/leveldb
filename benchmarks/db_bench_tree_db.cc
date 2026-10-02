@@ -368,6 +368,8 @@ class Benchmark {
         ReadSequential();
       } else if (name == Slice("readrandom")) {
         ReadRandom();
+      } else if (name == Slice("readskewed")) {
+        ReadSkewed();
       } else if (name == Slice("readrand100K")) {
         int n = reads_;
         reads_ /= 1000;
@@ -479,6 +481,36 @@ class Benchmark {
       db_->get(key, &value);
       FinishedSingleOp();
     }
+  }
+
+  // 20% of keys are hot and 80% of requests go there
+  void ReadSkewed(ThreadState* thread) {
+    ReadOptions options;
+    std::string value;
+    int found = 0;
+    KeyBuffer key;
+    const int hot_range = std::max(1, FLAGS_num / 5);
+    for (int i = 0; i < reads_; i++) {
+      int k;
+      if (thread->rand.Uniform(100) < 80) {
+        k = thread->rand.Uniform(hot_range);
+      } else {
+        const int cold_range = FLAGS_num - hot_range;
+        if (cold_range > 0) {
+          k = hot_range + thread->rand.Uniform(cold_range);
+        } else {
+          k = 0;
+        }
+      }
+      key.Set(k);
+      if (db_->Get(options, key.slice(), &value).ok()) {
+        found++;
+      }
+      thread->stats.FinishedSingleOp();
+    }
+    char msg[100];
+    std::snprintf(msg, sizeof(msg), "(%d of %d found, 80/20 skew)", found, reads_);
+    thread->stats.AddMessage(msg);
   }
 };
 

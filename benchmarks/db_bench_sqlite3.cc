@@ -36,6 +36,7 @@ static const char* FLAGS_benchmarks =
     "overwrite,"
     "overwritebatch,"
     "readrandom,"
+    "readskewed,"
     "readseq,"
     "fillrand100K,"
     "fillseq100K,"
@@ -312,7 +313,7 @@ class Benchmark {
   }
 
  public:
-  enum Order { SEQUENTIAL, RANDOM };
+  enum Order { SEQUENTIAL, RANDOM, SKEWED };
   enum DBState { FRESH, EXISTING };
 
   Benchmark()
@@ -400,7 +401,10 @@ class Benchmark {
         ReadSequential();
       } else if (name == Slice("readrandom")) {
         Read(RANDOM, 1);
-      } else if (name == Slice("readrand100K")) {
+      } else if (name == Slice("readskewed")) {
+        Read(SKEWED, 1);
+      }
+      else if (name == Slice("readrand100K")) {
         int n = reads_;
         reads_ /= 1000;
         Read(RANDOM, 1);
@@ -527,21 +531,28 @@ class Benchmark {
 
     bool transaction = (entries_per_batch > 1);
     for (int i = 0; i < num_entries; i += entries_per_batch) {
-      // Begin write transaction
       if (FLAGS_transaction && transaction) {
         status = sqlite3_step(begin_trans_stmt);
         StepErrorCheck(status);
         status = sqlite3_reset(begin_trans_stmt);
         ErrorCheck(status);
       }
-
-      // Create and execute SQL statements
       for (int j = 0; j < entries_per_batch; j++) {
         const char* value = gen_.Generate(value_size).data();
-
-        // Create values for key-value pair
-        const int k =
-            (order == SEQUENTIAL) ? i + j : (rand_.Next() % num_entries);
+        int k;
+        if (order == SEQUENTIAL) {
+          k = i;
+        } else if (order == RANDOM) {
+          k = rand_.Next() % num_;
+        } else {  // SKEWED
+          int hot_range = std::max(1, num_entries / 5);
+          if (rand_.Next() % 100 < 80) {
+            k = rand_.Next() % hot_range;
+          } else {
+            int cold_range = num_entries - hot_range;
+            k = hot_range + rand_.Next() % cold_range;
+          }
+        }
         char key[100];
         std::snprintf(key, sizeof(key), "%016d", k);
 
