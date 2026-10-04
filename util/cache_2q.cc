@@ -167,7 +167,6 @@ class TwoQueueCache {
   Cache::Handle* Lookup(const Slice& key, uint32_t hash);
   void Release(Cache::Handle* handle);
   void Erase(const Slice& key, uint32_t hash);
-  void Prune();
   size_t TotalCharge() const {
     MutexLock l(&mutex_);
     return usage_;
@@ -366,26 +365,6 @@ void TwoQueueCache::Erase(const Slice& key, uint32_t hash) {
   RemoveE(e);
 }
 
-void TwoQueueCache::Prune() {
-  // ADDED: Remove unused resident entries and all ghost entries.
-  MutexLock l(&mutex_);
-  TwoQueueHandle* heads[] = {&a1in_, &am_};
-  for (TwoQueueHandle* head : heads) {
-    TwoQueueHandle* e = head->next;
-    while (e != head) {
-      TwoQueueHandle* next = e->next;
-      if (e->refs == 1) {
-        table_.Remove(e->key(), e->hash);
-        RemoveE(e);
-      }
-      e = next;
-    }
-  }
-  while (a1out_.next != &a1out_) {
-    EvictA1Out(a1out_.next);
-  }
-}
-
 // HELPERS
 //ADDED: helper function to remove entry from cache
 void TwoQueueCache::RemoveE(TwoQueueHandle* e) {
@@ -547,11 +526,6 @@ class ShardedTwoQueueCache : public Cache {
   uint64_t NewId() override {
     MutexLock l(&id_mutex_);
     return ++(last_id_);
-  }
-  void Prune() override {
-    for (int s = 0; s < kNumShards; s++) {
-      shard_[s].Prune();
-    }
   }
   size_t TotalCharge() const override {
     size_t total = 0;
