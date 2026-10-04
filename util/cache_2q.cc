@@ -15,8 +15,6 @@
 
 namespace leveldb {
 
-Cache::~Cache() {}
-
 namespace {
 enum class FromQueue {A1In, A1Out, Am};
 
@@ -176,16 +174,17 @@ class TwoQueueCache {
   }
 
  private:
-  void List_Remove(TwoQueueHandle* e);
-  void List_Append(TwoQueueHandle* list, TwoQueueHandle* e);
-  void Ref(TwoQueueHandle* e);
-  void Unref(TwoQueueHandle* e);
-  void RemoveE(TwoQueueHandle* e);
-  void ToA1Out(TwoQueueHandle* e);
-  void EvictAm(TwoQueueHandle* e);
-  void EvictA1Out(TwoQueueHandle* e);
-  TwoQueueHandle* EvictA1In();
-  void Evict();
+  void List_Remove(TwoQueueHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void List_Append(TwoQueueHandle* list, TwoQueueHandle* e)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void Ref(TwoQueueHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void Unref(TwoQueueHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void RemoveE(TwoQueueHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void ToA1Out(TwoQueueHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void EvictAm(TwoQueueHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void EvictA1Out(TwoQueueHandle* e) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  TwoQueueHandle* EvictA1In() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void Evict() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void Free_List(TwoQueueHandle* head);
   void Free_Out_List(TwoQueueHandle* head);
   
@@ -234,13 +233,18 @@ TwoQueueCache::~TwoQueueCache() {
 }
 
 void TwoQueueCache::Ref(TwoQueueHandle* e) {
+  // CHANGED: Promote A1In hits to Am; keep Am hits as LRU updates.
   assert(e->refs > 0);
-  if (e->refs == 1 && e->in_cache) {  
-    if (e->from == FromQueue::Am) { // ADDED: Am is the LRU, thus we only move the entry for Am
+  if (e->refs == 1 && e->in_cache) {
+    if (e->from == FromQueue::A1In) {
+      List_Remove(e);
+      a1in_charge_ -= e->charge;
+      e->from = FromQueue::Am;
+      List_Append(&in_use_, e);
+    } else if (e->from == FromQueue::Am) { // ADDED: Am is the LRU, thus we only move the entry for Am
       List_Remove(e);                // ADDED: we don't do A1In bc that would break FIFO
       List_Append(&in_use_, e);
     }
-    
   }
   e->refs++;
 }
@@ -274,7 +278,12 @@ void TwoQueueCache::List_Append(TwoQueueHandle* list, TwoQueueHandle* e) {
 Cache::Handle* TwoQueueCache::Lookup(const Slice& key, uint32_t hash) {
   MutexLock l(&mutex_);
   TwoQueueHandle* e = table_.Lookup(key, hash);
-  if (e != nullptr && e->from != FromQueue::A1Out) { // ADDED: A1Out check
+  // ADDED: A1Out check
+  // CHANGED: Ghost entries retain no value and must return a miss.
+  if (e != nullptr && e->from == FromQueue::A1Out) {
+    return nullptr;
+  }
+  if (e != nullptr) {
     Ref(e);
   }
   return reinterpret_cast<Cache::Handle*>(e);
@@ -357,6 +366,26 @@ void TwoQueueCache::Erase(const Slice& key, uint32_t hash) {
   RemoveE(e);
 }
 
+void TwoQueueCache::Prune() {
+  // ADDED: Remove unused resident entries and all ghost entries.
+  MutexLock l(&mutex_);
+  TwoQueueHandle* heads[] = {&a1in_, &am_};
+  for (TwoQueueHandle* head : heads) {
+    TwoQueueHandle* e = head->next;
+    while (e != head) {
+      TwoQueueHandle* next = e->next;
+      if (e->refs == 1) {
+        table_.Remove(e->key(), e->hash);
+        RemoveE(e);
+      }
+      e = next;
+    }
+  }
+  while (a1out_.next != &a1out_) {
+    EvictA1Out(a1out_.next);
+  }
+}
+
 // HELPERS
 //ADDED: helper function to remove entry from cache
 void TwoQueueCache::RemoveE(TwoQueueHandle* e) {
@@ -415,7 +444,8 @@ TwoQueueHandle* TwoQueueCache::EvictA1In() {
 // ADDED: Evict logic
 void TwoQueueCache::Evict(){
   // if exceed capacity
-  while (usage_ > capacity_) {
+  // CHANGED: Check both the total capacity and the A1In target.
+  while (usage_ > capacity_ || a1in_charge_ > kin_capacity_) {
     bool evicted = false;
     // if we are past kin, aka desired capacity of the queue, we push oldest into A1Out to prevent overflow
     if (a1in_charge_ > kin_capacity_) {
@@ -429,16 +459,18 @@ void TwoQueueCache::Evict(){
       continue;
     }
     // otherwise, evict LRU
-    if (am_.next != &am_) {
+    if (usage_ > capacity_ && am_.next != &am_) {
       EvictAm(am_.next);
       continue;
     }
 
-    // worst case go back to trying to empty A1in
-    TwoQueueHandle* oldest = EvictA1In();
-    if (oldest != nullptr) {
-      ToA1Out(oldest);
-      continue;
+    if (usage_ > capacity_) {
+      // worst case go back to trying to empty A1in
+      TwoQueueHandle* oldest = EvictA1In();
+      if (oldest != nullptr) {
+        ToA1Out(oldest);
+        continue;
+      }
     }
     break;
   }
@@ -532,6 +564,7 @@ class ShardedTwoQueueCache : public Cache {
 
 }  // end anonymous namespace
 
-Cache* NewLRUCache(size_t capacity) { return new ShardedTwoQueueCache(capacity); }
+// CHANGED: Expose 2Q through its own factory for side-by-side testing.
+Cache* New2QCache(size_t capacity) { return new ShardedTwoQueueCache(capacity); }
 
 }  // namespace leveldb

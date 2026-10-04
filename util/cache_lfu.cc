@@ -16,8 +16,6 @@
 
 namespace leveldb {
 
-Cache::~Cache() {}
-
 namespace {
 
 // LFU cache implementation (modified from LevelDB's LRU cache)  // ADDED
@@ -473,8 +471,7 @@ class ShardedLRUCache : public Cache {
 
 }  // end anonymous namespace
 
-// Name kept as NewLRUCache so cache.h and existing callers don't change,
-// but this now returns the LFU-policy cache.  // ADDED
-Cache* NewLRUCache(size_t capacity) { return new ShardedLRUCache(capacity); }
+// CHANGED: lfu has its own factory; newlrucache remains lru
+Cache* NewLFUCache(size_t capacity) { return new ShardedLRUCache(capacity); }
 
 }  // namespace leveldb

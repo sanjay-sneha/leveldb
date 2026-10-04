@@ -174,6 +174,8 @@ target_sources(leveldb
     "util/arena.h"
     "util/bloom.cc"
     "util/cache.cc"
+    "util/cache_lfu.cc"  # ADDED: LFU cache implementation.
+    "util/cache_2q.cc"   # ADDED: 2Q cache implementation.
     "util/coding.cc"
     "util/coding.h"
     "util/comparator.cc"
@@ -344,6 +346,7 @@ if(LEVELDB_BUILD_TESTS)
         "util/arena_test.cc"
         "util/bloom_test.cc"
         "util/cache_test.cc"
+        "util/unit_tests.cc"  # ADDED: Policy-specific cache tests.
         "util/coding_test.cc"
         "util/crc32c_test.cc"
         "util/hash_test.cc"

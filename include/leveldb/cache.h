@@ -31,6 +31,12 @@ class LEVELDB_EXPORT Cache;
 // of Cache uses a least-recently-used eviction policy.
 LEVELDB_EXPORT Cache* NewLRUCache(size_t capacity);
 
+// ADDED: Create a cache with a least-frequently-used eviction policy.
+LEVELDB_EXPORT Cache* NewLFUCache(size_t capacity);
+
+// ADDED: Create a cache with a 2Q eviction policy.
+LEVELDB_EXPORT Cache* New2QCache(size_t capacity);
+
 class LEVELDB_EXPORT Cache {
  public:
   Cache() = default;
