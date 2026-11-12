@@ -37,6 +37,9 @@ LEVELDB_EXPORT Cache* NewLFUCache(size_t capacity);
 // ADDED: Create a cache with a 2Q eviction policy.
 LEVELDB_EXPORT Cache* New2QCache(size_t capacity);
 
+// ADDED: Create a cache with a ARC eviction policy.
+LEVELDB_EXPORT Cache* NewARCCache(size_t capacity);
+
 class LEVELDB_EXPORT Cache {
  public:
   Cache() = default;
