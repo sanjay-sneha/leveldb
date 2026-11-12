@@ -61,6 +61,8 @@ class CacheTestBase : public testing::Test {
     current_->deleted_values_.push_back(DecodeValue(v));
   }
 
+  static void BenchmarkDeleter(const Slice&, void*) {}
+
   std::vector<int> deleted_keys_;
   std::vector<int> deleted_values_;
   Cache* cache_ = nullptr;
@@ -79,6 +81,11 @@ class CacheTestBase : public testing::Test {
   void Insert(int key, int value, int charge = 1) {
     cache_->Release(cache_->Insert(EncodeKey(key), EncodeValue(value), charge,
                                    &CacheTestBase::Deleter));
+  }
+
+  void InsertForBenchmark(int key, int value, int charge = 1) {
+    cache_->Release(cache_->Insert(EncodeKey(key), EncodeValue(value), charge,
+                                   &CacheTestBase::BenchmarkDeleter));
   }
 
   Cache::Handle* InsertAndReturnHandle(int key, int value, int charge = 1) {
@@ -301,6 +308,43 @@ INSTANTIATE_TEST_SUITE_P(
       return "Unknown";
     });
 
+// measures hit rate under a uniform random read pattern
+TEST_P(CacheParamTest, BenchmarkUniformHitRate) {
+  const int kTotalOps = 50000;
+  const int kKeySpace = 2500;
+
+  for (int i = 0; i < kKeySpace; i++) {
+    InsertForBenchmark(i, i * 2);
+  }
+
+  std::mt19937 rng(7);
+  std::uniform_int_distribution<int> key_dist(0, kKeySpace - 1);
+
+  int hits = 0;
+  auto start = std::chrono::high_resolution_clock::now();
+
+  for (int i = 0; i < kTotalOps; i++) {
+    const int key = key_dist(rng);
+    if (Lookup(key) != -1) {
+      hits++;
+    } else {
+      InsertForBenchmark(key, key * 2);
+    }
+  }
+
+  auto elapsed = std::chrono::high_resolution_clock::now() - start;
+  const double duration_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+  const double hit_rate = (100.0 * hits) / kTotalOps;
+
+  std::cout << "[ PERFORMANCE ] "
+            << testing::UnitTest::GetInstance()->current_test_info()->name()
+            << " | Uniform Read Hit Rate: " << hit_rate << "% (" << hits << "/"
+            << kTotalOps << " hits) | Latency: " << duration_ms << " ms\n";
+
+  ASSERT_GT(hits, 0);
+}
+
 // measures hit rate under 80/20 skewed read access pattern (mimics readskewed benchmark)
 TEST_P(CacheParamTest, BenchmarkSkewedHitRate) {
   const int kTotalOps = 50000;
@@ -309,7 +353,7 @@ TEST_P(CacheParamTest, BenchmarkSkewedHitRate) {
 
   // pre-fill cache
   for (int i = 0; i < kKeySpace; i++) {
-    Insert(i, i * 2);
+    InsertForBenchmark(i, i * 2);
   }
 
   std::mt19937 rng(42);  // fixed seed for repeatable benchmark
@@ -326,7 +370,7 @@ TEST_P(CacheParamTest, BenchmarkSkewedHitRate) {
     if (res != -1) {
       hits++;
     } else {
-      Insert(key, key * 2);  // reload missing key
+      InsertForBenchmark(key, key * 2);  // reload missing key
     }
   }
 
@@ -350,14 +394,14 @@ TEST_P(CacheParamTest, BenchmarkScanResistance) {
 
   // establish a hot working set by inserting and repeatedly accessing keys
   for (int i = 0; i < kHotSetSize; i++) {
-    Insert(i, i + 100);
+    InsertForBenchmark(i, i + 100);
     Lookup(i);
     Lookup(i);
   }
 
   // perform a massive sequential scan of one-hit-wonder keys
   for (int i = 10000; i < 10000 + kScanSize; i++) {
-    Insert(i, i + 1);
+    InsertForBenchmark(i, i + 1);
   }
 
   // check how many hot working set entries survived the scan
@@ -375,42 +419,115 @@ TEST_P(CacheParamTest, BenchmarkScanResistance) {
             << " | Scan Resistance Survival: " << survival_pct << "% ("
             << retained_hot_keys << "/" << kHotSetSize << " hot keys retained)\n";
 
-  ASSERT_GE(retained_hot_keys, 0);
 }
 
-// measures throughput of rapid mixed operations (insert, lookup, erase)
-TEST_P(CacheParamTest, BenchmarkThroughput) {
+// compares cache throughput with paired, order-rotated workloads
+TEST(CachePerformance, BenchmarkPairedThroughputRatios) {
   const int kOperations = 100000;
+  const int kRepeats = 100;
+  const int kCapacity = CacheParamTest::kBenchmarkCapacity;
+
+  struct Operation {
+    int type;
+    int key;
+  };
+
   std::mt19937 rng(12345);
   std::uniform_int_distribution<int> op_dist(0, 9);
   std::uniform_int_distribution<int> key_dist(0, 1500);
-
-  auto start = std::chrono::high_resolution_clock::now();
-
+  std::vector<Operation> operations;
+  operations.reserve(kOperations);
   for (int i = 0; i < kOperations; i++) {
-    int key = key_dist(rng);
-    int op = op_dist(rng);
+    operations.push_back({op_dist(rng), key_dist(rng)});
+  }
 
-    if (op < 6) {
-      Lookup(key);  // 60% lookups
-    } else if (op < 9) {
-      Insert(key, key + 1);  // 30% inserts
-    } else {
-      Erase(key);  // 10% erases
+  auto run_workload = [&operations](Cache* cache) {
+    for (const Operation& operation : operations) {
+      if (operation.type < 6) {
+        Cache::Handle* handle = cache->Lookup(EncodeKey(operation.key));
+        if (handle != nullptr) {
+          cache->Release(handle);
+        }
+      } else if (operation.type < 9) {
+        Cache::Handle* handle = cache->Insert(
+            EncodeKey(operation.key), EncodeValue(operation.key + 1), 1,
+            &CacheTestBase::BenchmarkDeleter);
+        cache->Release(handle);
+      } else {
+        cache->Erase(EncodeKey(operation.key));
+      }
+    }
+  };
+
+  std::vector<double> throughput_samples[3];
+  std::vector<double> lfu_lru_ratios;
+  std::vector<double> twoq_lru_ratios;
+  for (std::vector<double>& samples : throughput_samples) {
+    samples.reserve(kRepeats);
+  }
+  lfu_lru_ratios.reserve(kRepeats);
+  twoq_lru_ratios.reserve(kRepeats);
+  for (int repeat = 0; repeat < kRepeats; repeat++) {
+    Cache* caches[] = {NewLRUCache(kCapacity), NewLFUCache(kCapacity),
+                       New2QCache(kCapacity)};
+    const int order[] = {repeat % 3, (repeat + 1) % 3, (repeat + 2) % 3};
+
+    // Warm each policy with identical work before the timed pass.
+    for (int policy : order) {
+        run_workload(caches[policy]);
+    }
+
+    double operations_per_second[3];
+    for (int policy : order) {
+      const auto start = std::chrono::steady_clock::now();
+      run_workload(caches[policy]);
+      const std::chrono::duration<double> elapsed =
+          std::chrono::steady_clock::now() - start;
+      operations_per_second[policy] = kOperations / elapsed.count();
+        throughput_samples[policy].push_back(operations_per_second[policy]);
+    }
+
+    lfu_lru_ratios.push_back(operations_per_second[kLFU] /
+                             operations_per_second[kLRU]);
+    twoq_lru_ratios.push_back(operations_per_second[k2Q] /
+                              operations_per_second[kLRU]);
+
+    for (Cache* cache : caches) {
+      delete cache;
     }
   }
 
-  auto elapsed = std::chrono::high_resolution_clock::now() - start;
-  double duration_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-  double qps = (kOperations / (duration_ms / 1000.0));
+  auto summarize = [](std::vector<double>* ratios) {
+    std::sort(ratios->begin(), ratios->end());
+    return std::vector<double>{(*ratios)[ratios->size() / 2], ratios->front(),
+                               ratios->back()};
+  };
+  const std::vector<double> lru_throughput = summarize(&throughput_samples[kLRU]);
+  const std::vector<double> lfu_throughput = summarize(&throughput_samples[kLFU]);
+  const std::vector<double> twoq_throughput = summarize(&throughput_samples[k2Q]);
+  const std::vector<double> lfu_summary = summarize(&lfu_lru_ratios);
+  const std::vector<double> twoq_summary = summarize(&twoq_lru_ratios);
+  const bool lfu_inconclusive =
+      lfu_summary[1] <= 1.0 && lfu_summary[2] >= 1.0;
+  const bool twoq_inconclusive =
+      twoq_summary[1] <= 1.0 && twoq_summary[2] >= 1.0;
 
   std::cout << "[ PERFORMANCE ] "
             << testing::UnitTest::GetInstance()->current_test_info()->name()
-            << " | Mixed Churn Ops/sec: " << static_cast<uint64_t>(qps)
-            << " | Duration: " << duration_ms << " ms\n";
+            << " | Median throughput: LRU "
+            << static_cast<uint64_t>(lru_throughput[0]) << " ops/sec, LFU "
+            << static_cast<uint64_t>(lfu_throughput[0]) << " ops/sec, 2Q "
+            << static_cast<uint64_t>(twoq_throughput[0]) << " ops/sec"
+            << " | LFU/LRU median ratio: " << lfu_summary[0] << " range ["
+            << lfu_summary[1] << ", " << lfu_summary[2] << "]"
+            << (lfu_inconclusive ? " cannot distinguish throughput" : "")
+            << " | 2Q/LRU median ratio: " << twoq_summary[0] << " range ["
+            << twoq_summary[1] << ", " << twoq_summary[2] << "]"
+            << (twoq_inconclusive ? " cannot distinguish throughput" : "")
+            << " (" << kRepeats << " paired repetitions)\n";
 
-  ASSERT_GT(duration_ms, 0);
+  ASSERT_GT(lfu_summary[0], 0);
+  ASSERT_GT(twoq_summary[0], 0);
 }
 
 }  // namespace leveldb
