@@ -20,13 +20,14 @@ class Histogram {
 
   std::string ToString() const;
 
- private:
-  enum { kNumBuckets = 154 };
-
+  // CHANGED: Made public so benchmarks can report p50/p99 directly.
   double Median() const;
   double Percentile(double p) const;
   double Average() const;
   double StandardDeviation() const;
+
+ private:
+  enum { kNumBuckets = 154 };
 
   static const double kBucketLimit[kNumBuckets];
 

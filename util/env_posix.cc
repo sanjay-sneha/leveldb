@@ -921,6 +921,11 @@ void EnvPosixTestHelper::SetReadOnlyMMapLimit(int limit) {
   g_mmap_limit = limit;
 }
 
+// ADDED: See env_posix_test_helper.h.
+void SetReadOnlyMMapLimitForBenchmarks(int limit) {
+  EnvPosixTestHelper::SetReadOnlyMMapLimit(limit);
+}
+
 Env* Env::Default() {
   static PosixDefaultEnv env_container;
   return env_container.env();

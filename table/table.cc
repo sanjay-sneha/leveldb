@@ -10,6 +10,7 @@
 #include "leveldb/filter_policy.h"
 #include "leveldb/options.h"
 #include "table/block.h"
+#include "table/bloom_stats.h"  // ADDED: Bloom filter counters.
 #include "table/filter_block.h"
 #include "table/format.h"
 #include "table/two_level_iterator.h"
@@ -19,6 +20,10 @@ namespace leveldb {
 
 struct Table::Rep {
   ~Rep() {
+    // ADDED: Filter memory is released together with the table.
+    if (filter != nullptr) {
+      bloom_stats_internal::RecordFilterReleased(filter_bytes);
+    }
     delete filter;
     delete[] filter_data;
     delete index_block;
@@ -30,6 +35,7 @@ struct Table::Rep {
   uint64_t cache_id;
   FilterBlockReader* filter;
   const char* filter_data;
+  uint64_t filter_bytes = 0;  // ADDED: Size of the loaded filter block.
 
   BlockHandle metaindex_handle;  // Handle to metaindex_block: saved from footer
   Block* index_block;
@@ -129,9 +135,26 @@ void Table::ReadFilter(const Slice& filter_handle_value) {
     rep_->filter_data = block.data.data();  // Will need to delete later
   }
   rep_->filter = new FilterBlockReader(rep_->options.filter_policy, block.data);
+  // ADDED: Track filter memory loaded into this table.
+  rep_->filter_bytes = block.data.size();
+  bloom_stats_internal::RecordFilterLoaded(rep_->filter_bytes);
 }
 
 Table::~Table() { delete rep_; }
+
+// ADDED: True while the current thread is inside Table::InternalGet, so that
+// block reads are attributed to point lookups and not to compactions or scans.
+static thread_local bool tl_in_point_lookup = false;
+
+// ADDED: Whether the entry found by a block seek has the same user key as the
+// lookup key. Internal keys end in an 8-byte sequence/type trailer.
+static bool SameUserKey(const Slice& found, const Slice& target) {
+  if (found.size() >= 8 && target.size() >= 8) {
+    return Slice(found.data(), found.size() - 8) ==
+           Slice(target.data(), target.size() - 8);
+  }
+  return found == target;
+}
 
 static void DeleteBlock(void* arg, void* ignored) {
   delete reinterpret_cast<Block*>(arg);
@@ -173,7 +196,9 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
       cache_handle = block_cache->Lookup(key);
       if (cache_handle != nullptr) {
         block = reinterpret_cast<Block*>(block_cache->Value(cache_handle));
+        if (tl_in_point_lookup) bloom_stats_internal::RecordBlockCacheHit();
       } else {
+        if (tl_in_point_lookup) bloom_stats_internal::RecordBlockRead();
         s = ReadBlock(table->rep_->file, options, handle, &contents);
         if (s.ok()) {
           block = new Block(contents);
@@ -184,6 +209,7 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
         }
       }
     } else {
+      if (tl_in_point_lookup) bloom_stats_internal::RecordBlockRead();
       s = ReadBlock(table->rep_->file, options, handle, &contents);
       if (s.ok()) {
         block = new Block(contents);
@@ -221,12 +247,24 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
     Slice handle_value = iiter->value();
     FilterBlockReader* filter = rep_->filter;
     BlockHandle handle;
-    if (filter != nullptr && handle.DecodeFrom(&handle_value).ok() &&
-        !filter->KeyMayMatch(handle.offset(), k)) {
+    const bool has_filter =
+        filter != nullptr && handle.DecodeFrom(&handle_value).ok();
+    if (has_filter && !filter->KeyMayMatch(handle.offset(), k)) {
       // Not found
+      bloom_stats_internal::RecordFilterNegative();  // ADDED
     } else {
+      tl_in_point_lookup = true;  // ADDED: attribute block reads to Get().
       Iterator* block_iter = BlockReader(this, options, iiter->value());
+      tl_in_point_lookup = false;
       block_iter->Seek(k);
+      // ADDED: Classify the filter's "maybe" as a true or false positive.
+      const bool key_present =
+          block_iter->Valid() && SameUserKey(block_iter->key(), k);
+      if (has_filter) {
+        bloom_stats_internal::RecordFilterPositive(key_present);
+      } else {
+        bloom_stats_internal::RecordUnfilteredLookup();
+      }
       if (block_iter->Valid()) {
         (*handle_result)(arg, block_iter->key(), block_iter->value());
       }

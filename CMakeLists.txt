@@ -157,6 +157,8 @@ target_sources(leveldb
     "table/block_builder.cc"
     "table/block_builder.h"
     "table/block.cc"
+    "table/bloom_stats.cc"  # ADDED: Bloom filter counters.
+    "table/bloom_stats.h"
     "table/block.h"
     "table/filter_block.cc"
     "table/filter_block.h"

@@ -8,11 +8,13 @@
 namespace leveldb {
 
 class EnvPosixTest;
+void SetReadOnlyMMapLimitForBenchmarks(int limit);  // ADDED: see below.
 
 // A helper for the POSIX Env to facilitate testing.
 class EnvPosixTestHelper {
  private:
   friend class EnvPosixTest;
+  friend void SetReadOnlyMMapLimitForBenchmarks(int limit);  // ADDED
 
   // Set the maximum number of read-only files that will be opened.
   // Must be called before creating an Env.
@@ -22,6 +24,12 @@ class EnvPosixTestHelper {
   // Must be called before creating an Env.
   static void SetReadOnlyMMapLimit(int limit);
 };
+
+// ADDED: Benchmark hook with the same effect as SetReadOnlyMMapLimit().
+// Passing 0 makes SSTables use pread() instead of mmap, so data blocks are
+// heap-allocated and can be inserted into the block cache even when
+// compression is disabled. Must be called before Env::Default().
+void SetReadOnlyMMapLimitForBenchmarks(int limit);
 
 }  // namespace leveldb
 

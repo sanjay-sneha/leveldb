@@ -4,9 +4,16 @@
 
 #include <sys/types.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <string>
+#include <vector>
 
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
@@ -15,7 +22,11 @@
 #include "leveldb/filter_policy.h"
 #include "leveldb/write_batch.h"
 #include "port/port.h"
+#include "table/bloom_stats.h"  // ADDED: Bloom filter counters.
 #include "util/crc32c.h"
+#if defined(LEVELDB_PLATFORM_POSIX)
+#include "util/env_posix_test_helper.h"  // ADDED: --use_mmap
+#endif
 #include "util/histogram.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
@@ -25,6 +36,7 @@
 //   Actual benchmarks:
 //      fillseq       -- write N values in sequential key order in async mode
 //      fillrandom    -- write N values in random key order in async mode
+//      fillperm      -- (ADDED) write each of N keys exactly once, shuffled
 //      overwrite     -- overwrite N values in random key order in async mode
 //      fillsync      -- write N/100 values in random key order in sync mode
 //      fill100K      -- write N/1000 100K values in random order in async mode
@@ -35,6 +47,9 @@
 //      readrandom    -- read N times in random order
 //      readmissing   -- read N missing keys in random order
 //      readhot       -- read N times in random order from 1% section of DB
+//      readmix       -- (ADDED) read N keys drawn from --read_dist, with a
+//                       --missing_frac fraction of them absent from the DB
+//      readskewed    -- (ADDED) readmix with --read_dist=zipfian
 //      seekrandom    -- N random seeks
 //      seekordered   -- N ordered seeks
 //      open          -- cost of opening a DB
@@ -129,6 +144,27 @@ static const char* FLAGS_db = nullptr;
 
 // ZSTD compression level to try out
 static int FLAGS_zstd_compression_level = 1;
+
+// ADDED: Block cache eviction policy: lru, lfu or 2q.
+static const char* FLAGS_cache_type = "lru";
+
+// ADDED: Key distribution for readmix: uniform or zipfian.
+static const char* FLAGS_read_dist = "uniform";
+
+// ADDED: Zipfian skew parameter in (0, 1). 0.99 matches YCSB's default.
+static double FLAGS_zipf_theta = 0.99;
+
+// ADDED: Fraction of readmix lookups that target keys absent from the DB.
+static double FLAGS_missing_frac = 0.0;
+
+// ADDED: If false, read SSTables with pread() instead of mmap. Without
+// compression, mmap'd blocks are never inserted into the block cache, so
+// cache-policy and Bloom experiments should run with --use_mmap=0.
+static bool FLAGS_use_mmap = true;
+
+// ADDED: If true, print a machine-readable RESULT line with Bloom filter
+// counters and latency percentiles after every benchmark.
+static bool FLAGS_bloom_stats = false;
 
 namespace leveldb {
 
@@ -339,9 +375,108 @@ class Stats {
       std::fprintf(stdout, "Microseconds per op:\n%s\n",
                    hist_.ToString().c_str());
     }
+    if (FLAGS_bloom_stats) {
+      ReportResultLine(name);
+    }
     std::fflush(stdout);
   }
+
+  // ADDED: One comma-separated line per benchmark, consumed by
+  // benchmarks/bloom_sweep.sh. Percentiles are -1 without --histogram=1.
+  void ReportResultLine(const Slice& name) {
+    const BloomStats b = GetBloomStats();
+    const double micros_per_op = seconds_ * 1e6 / done_;
+    const double ops_per_sec = done_ / ((finish_ - start_) * 1e-6);
+    const double p50 = FLAGS_histogram ? hist_.Median() : -1;
+    const double p99 = FLAGS_histogram ? hist_.Percentile(99.0) : -1;
+    const double p999 = FLAGS_histogram ? hist_.Percentile(99.9) : -1;
+    std::fprintf(
+        stdout,
+        "RESULT,%s,%d,%s,%s,%.3f,%.4f,%d,%.3f,%.1f,%.3f,%.3f,%.3f,"
+        "%llu,%llu,%llu,%llu,%.6f,%.4f,%llu,%llu,%llu,%llu\n",
+        name.ToString().c_str(), FLAGS_bloom_bits, FLAGS_cache_type,
+        FLAGS_read_dist, FLAGS_zipf_theta, FLAGS_missing_frac, done_,
+        micros_per_op, ops_per_sec, p50, p99, p999,
+        static_cast<unsigned long long>(b.filter_negatives),
+        static_cast<unsigned long long>(b.true_positives),
+        static_cast<unsigned long long>(b.false_positives),
+        static_cast<unsigned long long>(b.unfiltered_lookups),
+        b.FalsePositiveRate(), static_cast<double>(b.block_reads) / done_,
+        static_cast<unsigned long long>(b.block_reads),
+        static_cast<unsigned long long>(b.block_cache_hits),
+        static_cast<unsigned long long>(b.filter_bytes_resident),
+        static_cast<unsigned long long>(b.filter_loads));
+  }
 };
+
+// ADDED: Header matching Stats::ReportResultLine.
+static const char kResultHeader[] =
+    "RESULT,benchmark,bloom_bits,cache_type,read_dist,zipf_theta,missing_frac,"
+    "ops,micros_per_op,ops_per_sec,p50_us,p99_us,p999_us,filter_negatives,"
+    "true_positives,false_positives,unfiltered_lookups,fpr,block_reads_per_op,"
+    "block_reads,block_cache_hits,filter_bytes_resident,filter_loads";
+
+// ADDED: YCSB-style scrambled Zipfian generator over [0, n). Rank 0 is the
+// most popular item; ranks are hashed so hot keys are spread over the key
+// space instead of clustering in one SSTable.
+class ZipfianGenerator {
+ public:
+  ZipfianGenerator(uint64_t n, double theta) : n_(n), theta_(theta) {
+    zetan_ = Zeta(n, theta);
+    const double zeta2 = Zeta(2, theta);
+    alpha_ = 1.0 / (1.0 - theta);
+    eta_ = (1.0 - std::pow(2.0 / n, 1.0 - theta)) / (1.0 - zeta2 / zetan_);
+    half_pow_theta_ = 1.0 + std::pow(0.5, theta);
+  }
+
+  // u must be uniform in [0, 1).
+  uint64_t Next(double u) const {
+    const double uz = u * zetan_;
+    uint64_t rank;
+    if (uz < 1.0) {
+      rank = 0;
+    } else if (uz < half_pow_theta_) {
+      rank = 1;
+    } else {
+      rank = static_cast<uint64_t>(n_ *
+                                   std::pow(eta_ * u - eta_ + 1.0, alpha_));
+      if (rank >= n_) rank = n_ - 1;
+    }
+    return Fnv1a64(rank) % n_;
+  }
+
+ private:
+  static double Zeta(uint64_t n, double theta) {
+    double sum = 0;
+    for (uint64_t i = 1; i <= n; i++) sum += 1.0 / std::pow(i, theta);
+    return sum;
+  }
+
+  static uint64_t Fnv1a64(uint64_t v) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < 8; i++) {
+      h ^= (v >> (i * 8)) & 0xff;
+      h *= 0x100000001b3ULL;
+    }
+    return h;
+  }
+
+  uint64_t n_;
+  double theta_;
+  double zetan_;
+  double alpha_;
+  double eta_;
+  double half_pow_theta_;
+};
+
+// ADDED: Create the block cache selected by --cache_type.
+static Cache* NewCacheOfType(const char* type, size_t capacity) {
+  if (strcmp(type, "lru") == 0) return NewLRUCache(capacity);
+  if (strcmp(type, "lfu") == 0) return NewLFUCache(capacity);
+  if (strcmp(type, "2q") == 0) return New2QCache(capacity);
+  std::fprintf(stderr, "unknown --cache_type=%s (use lru, lfu or 2q)\n", type);
+  std::exit(1);
+}
 
 // State shared by all concurrent executions of the same benchmark.
 struct SharedState {
@@ -439,6 +574,8 @@ class Benchmark {
   int heap_counter_;
   CountComparator count_comparator_;
   int total_thread_count_;
+  port::Mutex zipf_mu_;                      // ADDED
+  std::unique_ptr<ZipfianGenerator> zipf_;  // ADDED: guarded by zipf_mu_
 
   void PrintHeader() {
     const int kKeySize = 16 + FLAGS_key_prefix;
@@ -520,7 +657,11 @@ class Benchmark {
 
  public:
   Benchmark()
-      : cache_(FLAGS_cache_size >= 0 ? NewLRUCache(FLAGS_cache_size) : nullptr),
+      // CHANGED: Always create the block cache here so --cache_type applies.
+      // Without --cache_size this uses LevelDB's default 8 MB capacity.
+      : cache_(NewCacheOfType(FLAGS_cache_type, FLAGS_cache_size >= 0
+                                                    ? FLAGS_cache_size
+                                                    : 8 << 20)),
         filter_policy_(FLAGS_bloom_bits >= 0
                            ? NewBloomFilterPolicy(FLAGS_bloom_bits)
                            : nullptr),
@@ -591,6 +732,9 @@ class Benchmark {
       } else if (name == Slice("fillrandom")) {
         fresh_db = true;
         method = &Benchmark::WriteRandom;
+      } else if (name == Slice("fillperm")) {  // ADDED
+        fresh_db = true;
+        method = &Benchmark::WritePermutation;
       } else if (name == Slice("overwrite")) {
         fresh_db = false;
         method = &Benchmark::WriteRandom;
@@ -618,6 +762,10 @@ class Benchmark {
         method = &Benchmark::SeekOrdered;
       } else if (name == Slice("readhot")) {
         method = &Benchmark::ReadHot;
+      } else if (name == Slice("readmix")) {  // ADDED
+        method = &Benchmark::ReadMix;
+      } else if (name == Slice("readskewed")) {  // ADDED
+        method = &Benchmark::ReadSkewed;
       } else if (name == Slice("readrandomsmall")) {
         reads_ /= 1000;
         method = &Benchmark::ReadRandom;
@@ -667,6 +815,7 @@ class Benchmark {
       }
 
       if (method != nullptr) {
+        ResetBloomStats();  // ADDED: counters cover this benchmark only.
         RunBenchmark(num_threads, name, method);
       }
     }
@@ -836,6 +985,37 @@ class Benchmark {
 
   void WriteRandom(ThreadState* thread) { DoWrite(thread, false); }
 
+  // ADDED: Write every key in [0, num) exactly once, in shuffled order.
+  // fillrandom samples with replacement, so only ~63% of keys exist and
+  // "existing-key" lookups miss about a third of the time. With fillperm,
+  // readmix's --missing_frac is the true fraction of absent-key lookups.
+  void WritePermutation(ThreadState* thread) {
+    std::vector<int> order(num_);
+    for (int i = 0; i < num_; i++) order[i] = i;
+    std::mt19937_64 rng(thread->rand.Next());
+    std::shuffle(order.begin(), order.end(), rng);
+
+    RandomGenerator gen;
+    WriteBatch batch;
+    int64_t bytes = 0;
+    KeyBuffer key;
+    for (int i = 0; i < num_; i += entries_per_batch_) {
+      batch.Clear();
+      for (int j = 0; j < entries_per_batch_ && i + j < num_; j++) {
+        key.Set(order[i + j]);
+        batch.Put(key.slice(), gen.Generate(value_size_));
+        bytes += value_size_ + key.slice().size();
+        thread->stats.FinishedSingleOp();
+      }
+      Status s = db_->Write(write_options_, &batch);
+      if (!s.ok()) {
+        std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        std::exit(1);
+      }
+    }
+    thread->stats.AddBytes(bytes);
+  }
+
   void DoWrite(ThreadState* thread, bool seq) {
     if (num_ != FLAGS_num) {
       char msg[100];
@@ -921,6 +1101,67 @@ class Benchmark {
       db_->Get(options, s, &value);
       thread->stats.FinishedSingleOp();
     }
+  }
+
+  // ADDED: Point lookups whose keys follow --read_dist. A --missing_frac
+  // fraction of lookups drop the key's last character, which yields a key
+  // that is absent but still falls inside SSTable key ranges, so the lookup
+  // reaches the Bloom filter instead of being skipped by range checks.
+  void ReadMix(ThreadState* thread) {
+    const bool zipfian = strcmp(FLAGS_read_dist, "zipfian") == 0;
+    if (!zipfian && strcmp(FLAGS_read_dist, "uniform") != 0) {
+      std::fprintf(stderr, "unknown --read_dist=%s\n", FLAGS_read_dist);
+      std::exit(1);
+    }
+    DoReadMix(thread, zipfian);
+  }
+
+  void ReadSkewed(ThreadState* thread) { DoReadMix(thread, true); }
+
+  void DoReadMix(ThreadState* thread, bool zipfian) {
+    const ZipfianGenerator* zipf = zipfian ? GetZipfian() : nullptr;
+    std::mt19937_64 rng(thread->rand.Next());
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+
+    ReadOptions options;
+    std::string value;
+    KeyBuffer key;
+    int found = 0;
+    int missing = 0;
+    for (int i = 0; i < reads_; i++) {
+      const int k = zipf != nullptr
+                        ? static_cast<int>(zipf->Next(unit(rng)))
+                        : static_cast<int>(rng() % FLAGS_num);
+      key.Set(k);
+      Slice s = key.slice();
+      if (FLAGS_missing_frac > 0 && unit(rng) < FLAGS_missing_frac) {
+        s = Slice(s.data(), s.size() - 1);
+        missing++;
+      }
+      if (db_->Get(options, s, &value).ok()) {
+        found++;
+      }
+      thread->stats.FinishedSingleOp();
+    }
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "(%d of %d found, %d missing-key probes, %s)", found, reads_,
+                  missing, zipfian ? "zipfian" : "uniform");
+    thread->stats.AddMessage(msg);
+  }
+
+  // ADDED: The Zipfian zeta constant is O(num) to compute, so build the
+  // generator once and share it between threads and benchmarks.
+  const ZipfianGenerator* GetZipfian() {
+    MutexLock l(&zipf_mu_);
+    if (zipf_ == nullptr) {
+      if (!(FLAGS_zipf_theta > 0 && FLAGS_zipf_theta < 1)) {
+        std::fprintf(stderr, "--zipf_theta must be in (0, 1)\n");
+        std::exit(1);
+      }
+      zipf_.reset(new ZipfianGenerator(FLAGS_num, FLAGS_zipf_theta));
+    }
+    return zipf_.get();
   }
 
   void ReadHot(ThreadState* thread) {
@@ -1065,6 +1306,25 @@ class Benchmark {
 }  // namespace leveldb
 
 int main(int argc, char** argv) {
+  // ADDED: --use_mmap must be applied before anything calls Env::Default(),
+  // including the leveldb::Options() constructor used just below.
+  for (int i = 1; i < argc; i++) {
+    int n;
+    char junk;
+    if (sscanf(argv[i], "--use_mmap=%d%c", &n, &junk) == 1 &&
+        (n == 0 || n == 1)) {
+      FLAGS_use_mmap = n;
+    }
+  }
+  if (!FLAGS_use_mmap) {
+#if defined(LEVELDB_PLATFORM_POSIX)
+    leveldb::SetReadOnlyMMapLimitForBenchmarks(0);
+#else
+    std::fprintf(stderr, "--use_mmap=0 is only supported on POSIX\n");
+    std::exit(1);
+#endif
+  }
+
   FLAGS_write_buffer_size = leveldb::Options().write_buffer_size;
   FLAGS_max_file_size = leveldb::Options().max_file_size;
   FLAGS_block_size = leveldb::Options().block_size;
@@ -1116,6 +1376,21 @@ int main(int argc, char** argv) {
       FLAGS_bloom_bits = n;
     } else if (sscanf(argv[i], "--open_files=%d%c", &n, &junk) == 1) {
       FLAGS_open_files = n;
+    } else if (strncmp(argv[i], "--cache_type=", 13) == 0) {  // ADDED
+      FLAGS_cache_type = argv[i] + 13;
+    } else if (strncmp(argv[i], "--read_dist=", 12) == 0) {  // ADDED
+      FLAGS_read_dist = argv[i] + 12;
+    } else if (sscanf(argv[i], "--zipf_theta=%lf%c", &d, &junk) == 1) {
+      FLAGS_zipf_theta = d;  // ADDED
+    } else if (sscanf(argv[i], "--missing_frac=%lf%c", &d, &junk) == 1 &&
+               d >= 0 && d <= 1) {
+      FLAGS_missing_frac = d;  // ADDED
+    } else if (sscanf(argv[i], "--use_mmap=%d%c", &n, &junk) == 1 &&
+               (n == 0 || n == 1)) {
+      FLAGS_use_mmap = n;  // ADDED
+    } else if (sscanf(argv[i], "--bloom_stats=%d%c", &n, &junk) == 1 &&
+               (n == 0 || n == 1)) {
+      FLAGS_bloom_stats = n;  // ADDED
     } else if (strncmp(argv[i], "--db=", 5) == 0) {
       FLAGS_db = argv[i] + 5;
     } else {
@@ -1131,6 +1406,10 @@ int main(int argc, char** argv) {
     leveldb::g_env->GetTestDirectory(&default_db_path);
     default_db_path += "/dbbench";
     FLAGS_db = default_db_path.c_str();
+  }
+
+  if (FLAGS_bloom_stats) {
+    std::fprintf(stdout, "%s\n", leveldb::kResultHeader);  // ADDED
   }
 
   leveldb::Benchmark benchmark;
