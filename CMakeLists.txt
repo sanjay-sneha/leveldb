@@ -179,6 +179,7 @@ target_sources(leveldb
     "util/cache_lfu.cc"  # ADDED: LFU cache implementation.
     "util/cache_2q.cc"   # ADDED: 2Q cache implementation.
     "util/cache_arc.cc"   # ADDED: arc cache implementation.
+    "util/cache_lecar.cc" # ADDED: lecar cache implementation.
     "util/coding.cc"
     "util/coding.h"
     "util/comparator.cc"
