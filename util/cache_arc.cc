@@ -18,6 +18,9 @@
 #include "port/thread_annotations.h"
 
 namespace leveldb {
+
+namespace {
+  
 // ARC cache implementation
 
 // Combination of LRU and LFU 
@@ -302,6 +305,7 @@ class ShardedARCCache : public Cache {
     return total;
   }
 };
+}
 
 Cache* NewARCCache(size_t capacity) { return new ShardedARCCache(capacity); }
 
