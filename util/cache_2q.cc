@@ -51,8 +51,8 @@ struct TwoQueueHandle {
   bool in_cache;     // Whether entry is in the cache.
   uint32_t refs;     // References, including cache reference, if present.
   uint32_t hash;     // Hash of key(); used for fast sharding and comparisons
-  char key_data[1];  // Beginning of key
   FromQueue from;   // ADDED: which queue should this node go back to if moved to in_use (A1In, Am)
+  char key_data[1];  // Beginning of key
 
   Slice key() const {
     // next is only equal to this if the LRU handle is the list head of an

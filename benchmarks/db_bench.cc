@@ -145,7 +145,7 @@ static const char* FLAGS_db = nullptr;
 // ZSTD compression level to try out
 static int FLAGS_zstd_compression_level = 1;
 
-// ADDED: Block cache eviction policy: lru, lfu or 2q.
+// ADDED: Block cache eviction policy: lru, lfu, 2q, arc or lecar.
 static const char* FLAGS_cache_type = "lru";
 
 // ADDED: Key distribution for readmix: uniform or zipfian.
@@ -474,7 +474,9 @@ static Cache* NewCacheOfType(const char* type, size_t capacity) {
   if (strcmp(type, "lru") == 0) return NewLRUCache(capacity);
   if (strcmp(type, "lfu") == 0) return NewLFUCache(capacity);
   if (strcmp(type, "2q") == 0) return New2QCache(capacity);
-  std::fprintf(stderr, "unknown --cache_type=%s (use lru, lfu or 2q)\n", type);
+  if (strcmp(type, "arc") == 0) return NewARCCache(capacity);
+  if (strcmp(type, "lecar") == 0) return NewLeCaRCache(capacity);
+  std::fprintf(stderr, "unknown --cache_type=%s (use lru, lfu, 2q, arc or lecar)\n", type);
   std::exit(1);
 }
 
