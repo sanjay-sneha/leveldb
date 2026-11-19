@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "leveldb/cache.h"
@@ -50,6 +52,11 @@
 //      readmix       -- (ADDED) read N keys drawn from --read_dist, with a
 //                       --missing_frac fraction of them absent from the DB
 //      readskewed    -- (ADDED) readmix with --read_dist=zipfian
+//      tracefill     -- (ADDED) load every key that --trace reads with a
+//                       nonzero value size, once, with that value size
+//      tracereplay   -- (ADDED) replay --trace in order: get -> Get,
+//                       set/add/replace/cas/append/prepend/incr/decr -> Put,
+//                       delete -> Delete
 //      seekrandom    -- N random seeks
 //      seekordered   -- N ordered seeks
 //      open          -- cost of opening a DB
@@ -161,6 +168,13 @@ static double FLAGS_missing_frac = 0.0;
 // compression, mmap'd blocks are never inserted into the block cache, so
 // cache-policy and Bloom experiments should run with --use_mmap=0.
 static bool FLAGS_use_mmap = true;
+
+// ADDED: Twitter cache-trace CSV for tracefill/tracereplay. Each line is
+// timestamp,key,key_size,value_size,client_id,operation,ttl.
+static const char* FLAGS_trace = nullptr;
+
+// ADDED: Maximum number of trace lines to use (negative means all).
+static int64_t FLAGS_trace_ops = -1;
 
 // ADDED: If true, print a machine-readable RESULT line with Bloom filter
 // counters and latency percentiles after every benchmark.
@@ -281,6 +295,8 @@ class Stats {
   int next_report_;
   int64_t bytes_;
   double last_op_finish_;
+  double excluded_micros_;  // ADDED: time spent paused (e.g. parsing input)
+  double pause_start_;      // ADDED
   Histogram hist_;
   std::string message_;
 
@@ -293,6 +309,8 @@ class Stats {
     done_ = 0;
     bytes_ = 0;
     seconds_ = 0;
+    excluded_micros_ = 0;  // ADDED
+    pause_start_ = 0;      // ADDED
     message_.clear();
     start_ = finish_ = last_op_finish_ = g_env->NowMicros();
   }
@@ -302,6 +320,7 @@ class Stats {
     done_ += other.done_;
     bytes_ += other.bytes_;
     seconds_ += other.seconds_;
+    excluded_micros_ += other.excluded_micros_;  // ADDED
     if (other.start_ < start_) start_ = other.start_;
     if (other.finish_ > finish_) finish_ = other.finish_;
 
@@ -311,7 +330,16 @@ class Stats {
 
   void Stop() {
     finish_ = g_env->NowMicros();
-    seconds_ = (finish_ - start_) * 1e-6;
+    seconds_ = (finish_ - start_ - excluded_micros_) * 1e-6;  // CHANGED
+  }
+
+  // ADDED: Exclude work between Pause() and Resume() from timing and from
+  // the next operation's latency, so only database operations are measured.
+  void Pause() { pause_start_ = g_env->NowMicros(); }
+  void Resume() {
+    const double now = g_env->NowMicros();
+    excluded_micros_ += now - pause_start_;
+    last_op_finish_ = now;
   }
 
   void AddMessage(Slice msg) { AppendWithSpace(&message_, msg); }
@@ -360,7 +388,7 @@ class Stats {
     if (bytes_ > 0) {
       // Rate is computed on actual elapsed time, not the sum of per-thread
       // elapsed times.
-      double elapsed = (finish_ - start_) * 1e-6;
+      double elapsed = seconds_;  // CHANGED: excludes paused time.
       char rate[100];
       std::snprintf(rate, sizeof(rate), "%6.1f MB/s",
                     (bytes_ / 1048576.0) / elapsed);
@@ -386,7 +414,7 @@ class Stats {
   void ReportResultLine(const Slice& name) {
     const BloomStats b = GetBloomStats();
     const double micros_per_op = seconds_ * 1e6 / done_;
-    const double ops_per_sec = done_ / ((finish_ - start_) * 1e-6);
+    const double ops_per_sec = done_ / seconds_;  // CHANGED: excludes pauses.
     const double p50 = FLAGS_histogram ? hist_.Median() : -1;
     const double p99 = FLAGS_histogram ? hist_.Percentile(99.0) : -1;
     const double p999 = FLAGS_histogram ? hist_.Percentile(99.9) : -1;
@@ -478,6 +506,73 @@ static Cache* NewCacheOfType(const char* type, size_t capacity) {
   if (strcmp(type, "lecar") == 0) return NewLeCaRCache(capacity);
   std::fprintf(stderr, "unknown --cache_type=%s (use lru, lfu, 2q, arc or lecar)\n", type);
   std::exit(1);
+}
+
+// ADDED: One request from a Twitter cache trace.
+struct TraceOp {
+  enum Type { kGet, kPut, kDelete, kOther } type;
+  std::string key;
+  int value_size;
+};
+
+// ADDED: Parse "timestamp,key,key_size,value_size,client_id,operation,ttl".
+// Fields are taken from the right so a comma inside a key cannot shift them.
+static bool ParseTraceLine(const std::string& line, TraceOp* op) {
+  size_t comma[6];
+  size_t pos = line.size();
+  for (int i = 5; i >= 2; i--) {  // ttl, op, client_id, value_size separators
+    pos = line.rfind(',', pos == 0 ? 0 : pos - 1);
+    if (pos == std::string::npos) return false;
+    comma[i] = pos;
+  }
+  comma[0] = line.find(',');
+  if (comma[0] == std::string::npos) return false;
+  comma[1] = line.rfind(',', comma[2] - 1);  // key_size separator
+  if (comma[1] == std::string::npos || comma[1] <= comma[0]) return false;
+
+  op->key.assign(line, comma[0] + 1, comma[1] - comma[0] - 1);
+  op->value_size = std::atoi(line.c_str() + comma[2] + 1);
+  const std::string name(line, comma[4] + 1, comma[5] - comma[4] - 1);
+  if (name == "get" || name == "gets") {
+    op->type = TraceOp::kGet;
+  } else if (name == "set" || name == "add" || name == "replace" ||
+             name == "cas" || name == "append" || name == "prepend" ||
+             name == "incr" || name == "decr") {
+    op->type = TraceOp::kPut;
+  } else if (name == "delete") {
+    op->type = TraceOp::kDelete;
+  } else {
+    op->type = TraceOp::kOther;
+  }
+  return !op->key.empty();
+}
+
+// ADDED: Value sizes must fit RandomGenerator's 1 MB buffer.
+static int ClampValueSize(int size) {
+  if (size < 1) return 1;
+  if (size > (512 << 10)) return 512 << 10;
+  return size;
+}
+
+static FILE* OpenTraceOrDie() {
+  if (FLAGS_trace == nullptr) {
+    std::fprintf(stderr, "tracefill/tracereplay need --trace=<csv file>\n");
+    std::exit(1);
+  }
+  FILE* f = std::fopen(FLAGS_trace, "r");
+  if (f == nullptr) {
+    std::fprintf(stderr, "cannot open --trace=%s\n", FLAGS_trace);
+    std::exit(1);
+  }
+  return f;
+}
+
+// ADDED: Read one line (without the newline). Returns false at end of file.
+static bool ReadLine(FILE* f, std::string* line) {
+  line->clear();
+  int c;
+  while ((c = std::fgetc(f)) != EOF && c != '\n') line->push_back(c);
+  return c != EOF || !line->empty();
 }
 
 // State shared by all concurrent executions of the same benchmark.
@@ -768,6 +863,11 @@ class Benchmark {
         method = &Benchmark::ReadMix;
       } else if (name == Slice("readskewed")) {  // ADDED
         method = &Benchmark::ReadSkewed;
+      } else if (name == Slice("tracefill")) {  // ADDED
+        fresh_db = true;
+        method = &Benchmark::TraceFill;
+      } else if (name == Slice("tracereplay")) {  // ADDED
+        method = &Benchmark::TraceReplay;
       } else if (name == Slice("readrandomsmall")) {
         reads_ /= 1000;
         method = &Benchmark::ReadRandom;
@@ -1152,6 +1252,107 @@ class Benchmark {
     thread->stats.AddMessage(msg);
   }
 
+  // ADDED: Load the trace's key set. A key is written once, with the first
+  // nonzero value size the trace reports for it. Keys that only ever appear
+  // with value size 0 (misses in Twitter's cache) stay absent, so the replay
+  // keeps the trace's real misses for the Bloom filter to answer.
+  void TraceFill(ThreadState* thread) {
+    FILE* f = OpenTraceOrDie();
+    std::unordered_set<uint64_t> loaded;  // 64-bit key hashes
+    std::hash<std::string> hasher;
+    RandomGenerator gen;
+    WriteBatch batch;
+    int64_t bytes = 0;
+    int64_t lines = 0;
+    std::string line;
+    TraceOp op;
+    while ((FLAGS_trace_ops < 0 || lines < FLAGS_trace_ops) &&
+           ReadLine(f, &line)) {
+      lines++;
+      if (!ParseTraceLine(line, &op) || op.value_size <= 0) continue;
+      if (!loaded.insert(hasher(op.key)).second) continue;
+      const int size = ClampValueSize(op.value_size);
+      batch.Put(op.key, gen.Generate(size));
+      bytes += size + op.key.size();
+      thread->stats.FinishedSingleOp();
+      if (loaded.size() % 1000 == 0) {
+        Status s = db_->Write(write_options_, &batch);
+        if (!s.ok()) {
+          std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          std::exit(1);
+        }
+        batch.Clear();
+      }
+    }
+    db_->Write(write_options_, &batch);
+    std::fclose(f);
+    thread->stats.AddBytes(bytes);
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "(%zu keys loaded from %" PRId64
+                  " trace lines)", loaded.size(), lines);
+    thread->stats.AddMessage(msg);
+  }
+
+  // ADDED: Replay the trace in order. Lines are parsed in batches while the
+  // timer is paused, so throughput and latency cover database work only.
+  void TraceReplay(ThreadState* thread) {
+    FILE* f = OpenTraceOrDie();
+    RandomGenerator gen;
+    ReadOptions read_options;
+    std::string value;
+    std::vector<TraceOp> batch(4096);
+    int64_t lines = 0, gets = 0, get_hits = 0, puts = 0, deletes = 0,
+            other = 0;
+    std::string line;
+    bool more = true;
+    while (more) {
+      thread->stats.Pause();
+      size_t n = 0;
+      while (n < batch.size() &&
+             (FLAGS_trace_ops < 0 || lines < FLAGS_trace_ops)) {
+        if (!ReadLine(f, &line)) {
+          more = false;
+          break;
+        }
+        lines++;
+        if (ParseTraceLine(line, &batch[n])) n++;
+      }
+      if (FLAGS_trace_ops >= 0 && lines >= FLAGS_trace_ops) more = false;
+      thread->stats.Resume();
+
+      for (size_t i = 0; i < n; i++) {
+        const TraceOp& op = batch[i];
+        switch (op.type) {
+          case TraceOp::kGet:
+            gets++;
+            if (db_->Get(read_options, op.key, &value).ok()) get_hits++;
+            break;
+          case TraceOp::kPut:
+            puts++;
+            db_->Put(write_options_, op.key,
+                     gen.Generate(ClampValueSize(op.value_size)));
+            break;
+          case TraceOp::kDelete:
+            deletes++;
+            db_->Delete(write_options_, op.key);
+            break;
+          case TraceOp::kOther:
+            other++;
+            continue;  // Not a key-value operation; not counted as an op.
+        }
+        thread->stats.FinishedSingleOp();
+      }
+    }
+    std::fclose(f);
+    char msg[256];
+    std::snprintf(msg, sizeof(msg),
+                  "(gets %" PRId64 " [%.1f%% found], puts %" PRId64
+                  ", deletes %" PRId64 ", skipped %" PRId64 ")",
+                  gets, gets ? 100.0 * get_hits / gets : 0.0, puts, deletes,
+                  other);
+    thread->stats.AddMessage(msg);
+  }
+
   // ADDED: The Zipfian zeta constant is O(num) to compute, so build the
   // generator once and share it between threads and benchmarks.
   const ZipfianGenerator* GetZipfian() {
@@ -1393,6 +1594,11 @@ int main(int argc, char** argv) {
     } else if (sscanf(argv[i], "--bloom_stats=%d%c", &n, &junk) == 1 &&
                (n == 0 || n == 1)) {
       FLAGS_bloom_stats = n;  // ADDED
+    } else if (strncmp(argv[i], "--trace=", 8) == 0) {  // ADDED
+      FLAGS_trace = argv[i] + 8;
+    } else if (sscanf(argv[i], "--trace_ops=%" SCNd64 "%c", &FLAGS_trace_ops,
+                      &junk) == 1) {
+      // ADDED: parsed in the condition.
     } else if (strncmp(argv[i], "--db=", 5) == 0) {
       FLAGS_db = argv[i] + 5;
     } else {
