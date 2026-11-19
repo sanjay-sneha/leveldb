@@ -1,3 +1,167 @@
+# CS598APE Project: Cache Eviction Policies and Bloom Filters in LevelDB
+ 
+**Team:** Sneha Dhital, Naomi Lin
+ 
+This fork of [LevelDB](https://github.com/google/leveldb) evaluates how the
+block cache eviction policy and the Bloom filter size affect read performance.
+We added four eviction policies alongside LevelDB's default sharded LRU cache
+(LFU, 2Q, ARC and LeCaR), instrumented LevelDB's Bloom filters, and benchmarked
+everything on synthetic workloads and a real Twitter production cache trace.
+ 
+The original LevelDB README is below this project section.
+ 
+## Hardware and software requirements
+ 
+We ran the experiments in the report on the course VM:
+ 
+| | |
+|---|---|
+| CPU | 4 × Intel Xeon Silver 4216 @ 2.10 GHz (22.5 MB cache) |
+| Memory | 15 GB RAM |
+| Disk | ~218 GB free |
+| OS | Ubuntu Linux |
+ 
+To build and run:
+ 
+- Linux/macOS with a C++17 compiler (g++ or clang) and CMake 3.22 or newer.
+- Git submodules (GoogleTest and Google Benchmark) checked out.
+- About 5 GB of free disk for the Twitter trace experiments (trace slice plus database copies).
+- `sudo` on Linux for the trace experiments, which use a cgroup memory cap
+  (`systemd-run`) and drop the OS page cache between runs.
+- `valgrind` for memory checking, `zstd` and `curl` to download the trace.
+
+Snappy is not required. However, without Snappy, LevelDB memory-maps
+table files and never inserts their blocks into the block cache, so all cache
+experiments have to be run with `--use_mmap=0` (and the provided scripts do this).
+ 
+## Building
+ 
+```
+git clone --recurse-submodules https://github.com/sanjay-sneha/leveldb
+cd leveldb
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j leveldb_tests db_bench
+```
+ 
+## What we changed
+ 
+| File | Status | Purpose |
+|---|---|---|
+| `util/cache_lfu.cc` | added | LFU cache: per-frequency buckets (kept in an `std::map`), LRU order within each frequency for tie-breaking |
+| `util/cache_2q.cc` | added | 2Q cache (A1in FIFO, A1out ghost queue, Am LRU) |
+| `util/cache_arc.cc` | added | ARC cache (T1/T2 resident lists, B1/B2 ghost lists, adaptive target) |
+| `util/cache_lecar.cc` | added | LeCaR cache (learned weighting between LRU and LFU experts) |
+| `include/leveldb/cache.h` | changed | Factory functions `NewLFUCache`, `New2QCache`, `NewARCCache`, `NewLeCaRCache` |
+| `util/unit_tests.cc` | added | Unit tests and small benchmarks for all cache policies |
+| `table/bloom_stats.h`, `table/bloom_stats.cc` | added | Counters for Bloom filter checks, true/false positives, block reads, filter memory |
+| `table/table.cc` | changed | Records the Bloom counters on the point-lookup path |
+| `util/bloom_test.cc` | changed | `BloomSweep` test: measured vs. theoretical false-positive rate per bits-per-key |
+| `util/env_posix.cc`, `util/env_posix_test_helper.h` | changed | Hook used by `db_bench --use_mmap=0` |
+| `util/histogram.h` | changed | Exposes percentiles so db_bench can report p50/p99 |
+| `benchmarks/db_bench.cc` | changed | New flags and benchmarks (see below) |
+| `benchmarks/bloom_sweep.sh` | added | Synthetic bits-per-key sweep across workloads |
+| `benchmarks/trace_sweep.sh` | added | Twitter trace replay across all cache policies |
+| `CMakeLists.txt` | changed | Builds the new source files |
+ 
+The modified regions are marked with `ADDED:` or `CHANGED:` comments.
+ 
+## Running the tests
+ 
+All project unit tests:
+ 
+```
+./leveldb_tests --gtest_filter='LFU*:TwoQ*:ARC*:LeCaR*:CachePerformance*:Bloom*'
+```
+ 
+- `LFUCacheTest.*`, `TwoQCacheTest.*`, `ARCCacheTest.*`, `LeCaRCacheTest.*`:
+  correctness of each policy (eviction order, ghost entries, scan resistance,
+  erase, pinned handles). The tests use `KeysInSameShard` to place keys in one of
+  the 16 shards so that eviction is deterministic.
+- `CachePerformance/CacheParamTest.*`: run for all five policies:
+  LevelDB-style keys and charges, uniform and 80/20 hit rate, scan resistance.
+- `CachePerformance.BenchmarkPairedThroughputRatios`: throughput of all
+  policies on identical operations, 100 paired, order-rotated repetitions.
+- `BloomSweep.BitsPerKeyVsFalsePositiveRate`: prints `BLOOM_SWEEP` CSV rows.
+
+Run the whole LevelDB suite with `./leveldb_tests`.
+ 
+### Valgrind
+ 
+```
+valgrind --leak-check=full ./leveldb_tests --gtest_filter='LFU*:TwoQ*:ARC*:LeCaR*:CachePerformance/*:BloomTest*'
+```
+ 
+Expected: `ERROR SUMMARY: 0 errors` and no leaks. End-to-end db_bench runs
+report 0 bytes definitely lost; the only report is 320 bytes "possibly lost"
+from upstream LevelDB's background compaction thread, which LevelDB
+intentionally never joins.
+ 
+## Benchmarks (db_bench)
+ 
+New `db_bench` flags:
+ 
+| Flag | Meaning |
+|---|---|
+| `--cache_type=lru\|lfu\|2q\|arc\|lecar` | Block cache eviction policy |
+| `--use_mmap=0` | Read tables with `pread` so blocks enter the block cache |
+| `--read_dist=uniform\|zipfian`, `--zipf_theta=0.99` | Key distribution for `readmix` |
+| `--missing_frac=F` | Fraction of `readmix` lookups for absent keys |
+| `--bloom_stats=1` | Print a `RESULT` CSV line per benchmark |
+| `--trace=FILE`, `--trace_ops=N` | Twitter trace for `tracefill` / `tracereplay` |
+ 
+New benchmarks: `fillperm` (each key written exactly once, shuffled),
+`readmix`, `readskewed` (Zipfian), `tracefill`, `tracereplay`.
+ 
+Example:
+ 
+```
+./db_bench --benchmarks=fillperm,compact,readmix --num=1000000 --use_mmap=0 \
+  --bloom_bits=10 --cache_type=arc --read_dist=zipfian --missing_frac=0.5 \
+  --histogram=1 --bloom_stats=1
+```
+ 
+### Bloom filter sweep
+ 
+```
+./leveldb_tests --gtest_filter='BloomSweep*' | grep BLOOM_SWEEP > bloom_sweep.csv
+../benchmarks/bloom_sweep.sh          # end-to-end; rebuilds the DB per setting
+```
+ 
+### Twitter trace replay
+ 
+We used cluster 52 of the Twitter cache traces
+([twitter/cache-trace](https://github.com/twitter/cache-trace), Yang et al., OSDI 2020),
+which the trace authors recommend for eviction studies. Download the first 20M requests from here:
+ 
+```
+mkdir -p ~/data && cd ~/data
+curl -s https://ftp.pdl.cmu.edu/pub/datasets/twemcacheWorkload/open_source/cluster52.sort.zst \
+  | zstd -dc | head -n 20000000 > twitter52.csv
+```
+ 
+Run every policy, with and without a 10-bit Bloom filter:
+ 
+```
+cd ~/leveldb/build
+TRACE=~/data/twitter52.csv ../benchmarks/trace_sweep.sh
+```
+ 
+The script loads the trace's keys once per Bloom setting, replays each policy
+on a fresh copy of that database under a 256 MB memory cap, and writes
+`trace_sweep.csv`. The settings can be changed with environment variables
+(`TRACE_OPS`, `CACHE_TYPES`, `BLOOM_BITS`, `MEMCAP`, `REPEATS`).
+ 
+## Known limitations
+ 
+- Concurrency of the new caches is not specifically tested.
+- LeCaR's learned weights are not checked directly by unit tests.
+- The 2Q ghost-list size limit is not covered by a dedicated test.
+
+---
+ 
+# Original LevelDB README
+
 LevelDB is a fast key-value storage library written at Google that provides an ordered mapping from string keys to string values.
 
 > **This repository is receiving very limited maintenance. We will only review the following types of changes.**
